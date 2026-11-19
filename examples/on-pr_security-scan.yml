@@ -1,0 +1,25 @@
+name: ON PR - Security scan
+
+# Security checks from zcsadmin/follia-ci-security, report-only.
+# Copy to .github/workflows/on-pr_security-scan.yml and set `languages`
+# (and `dockerfile` / `target-stage` if they differ from the defaults).
+
+on:
+  pull_request:
+    branches: [ "sandbox" ]   # services without a sandbox branch: [ "main" ]
+    paths-ignore:
+      - 'docs/**'
+      - 'okf/**'
+      - 'README.md'
+  schedule:
+    - cron: '0 5 * * 1'   # Monday 05:00 UTC (06:00/07:00 Europe/Rome), on the default branch
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  security-scan:
+    uses: zcsadmin/follia-ci-security/.github/workflows/security-scan.yml@v1
+    with:
+      languages: java

@@ -1,0 +1,30 @@
+rules:
+  - id: spring-data-mongo-regex-unquoted
+    languages: [java]
+    severity: ERROR
+    message: >-
+      Regex passed to Spring Data MongoDB without Pattern.quote(). If the value comes
+      from the request, the caller controls the regex (regex injection, ReDoS).
+      Escape it with Pattern.quote(...) or build the regex from a fixed pattern.
+    metadata:
+      category: security
+      cwe: "CWE-1333: Inefficient Regular Expression Complexity"
+      owasp: "A03:2021 - Injection"
+    patterns:
+      - pattern: $C.regex($X, ...)
+      # literal regex written in the code
+      - pattern-not: $C.regex("...", ...)
+      # escaped value, alone or with literal anchors around it
+      - pattern-not: $C.regex(Pattern.quote(...), ...)
+      - pattern-not: $C.regex("..." + Pattern.quote(...), ...)
+      - pattern-not: $C.regex(Pattern.quote(...) + "...", ...)
+      - pattern-not: $C.regex("..." + Pattern.quote(...) + "...", ...)
+      # variable assigned from Pattern.quote / Pattern.compile(Pattern.quote) in the same method
+      - pattern-not-inside: |
+          $T $V = Pattern.quote(...);
+          ...
+          $C.regex($V, ...);
+      - pattern-not-inside: |
+          $T $V = Pattern.compile(Pattern.quote(...), ...);
+          ...
+          $C.regex($V, ...);
