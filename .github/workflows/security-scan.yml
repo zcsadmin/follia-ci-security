@@ -1,0 +1,245 @@
+name: Security scan
+
+# Reusable workflow (AP-5544): security checks for Follia microservices, report-only.
+# No job fails because of findings; results go to the job summary.
+# - pull_request: only what the PR introduces (Semgrep baseline, gitleaks on the PR commits)
+# - any other event (schedule, workflow_dispatch): full scan of the repository
+# Secrets are checked only by gitleaks, which redacts them: Semgrep's p/secrets is left out
+# because its text output would print the secret values in the job summary.
+# Usage: see README.md.
+
+on:
+  workflow_call:
+    inputs:
+      languages:
+        description: "Comma-separated languages of the service: java, python, typescript (javascript is an alias)"
+        type: string
+        required: true
+      dockerfile:
+        description: "Path of the Dockerfile, used to find the base image"
+        type: string
+        default: ".build/dockerfiles/Dockerfile"
+      target-stage:
+        description: "Dockerfile stage that runs in production; falls back to the last FROM if no stage has this name"
+        type: string
+        default: "dist"
+      rules-ref:
+        description: "Ref of follia-ci-security to take the shared Semgrep rules from (keep it equal to the ref in 'uses:')"
+        type: string
+        default: "v1"
+
+permissions:
+  contents: read
+
+env:
+  SEMGREP_IMAGE: semgrep/semgrep:1.140.0
+  TRIVY_IMAGE: aquasec/trivy:0.67.2
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.28.0
+
+jobs:
+  semgrep:
+    name: Semgrep (code)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          fetch-depth: 0
+
+      - name: Checkout shared rules
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: zcsadmin/follia-ci-security
+          ref: ${{ inputs.rules-ref }}
+          path: ci
+          persist-credentials: false
+
+      - name: Run Semgrep
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          LANGUAGES: ${{ inputs.languages }}
+        run: |
+          args=(--config p/owasp-top-ten)
+          seen=" "
+          for lang in ${LANGUAGES//,/ }; do
+            lang=$(echo "$lang" | tr '[:upper:]' '[:lower:]')
+            case "$lang" in
+              java)                  rulesets=(p/java) ;;
+              python)                rulesets=(p/python) ;;
+              typescript|javascript) lang=typescript; rulesets=(p/typescript p/javascript) ;;
+              *) echo "::error::Unknown language '$lang' (allowed: java, python, typescript)"; exit 1 ;;
+            esac
+            [[ "$seen" == *" $lang "* ]] && continue
+            seen+="$lang "
+            for r in "${rulesets[@]}"; do args+=(--config "$r"); done
+            # shared rules of this language, if any
+            if compgen -G "ci/rules/$lang/*.yml" > /dev/null; then
+              args+=(--config "/rules/$lang/")
+            fi
+          done
+          # rules of the service repo, if any
+          if compgen -G "src/.semgrep/*.yml" > /dev/null; then
+            args+=(--config .semgrep/)
+          fi
+          if [ -n "$BASE_SHA" ]; then
+            args+=(--baseline-commit "$BASE_SHA")
+          fi
+          echo "Semgrep arguments: ${args[*]}"
+          docker run --rm -v "$PWD/src:/src" -v "$PWD/ci/rules:/rules:ro" -w /src "$SEMGREP_IMAGE" sh -c '
+            git config --global --add safe.directory /src
+            semgrep scan --metrics=off \
+              --exclude target --exclude node_modules "$@" \
+              --text-output=semgrep.txt --json-output=semgrep.json' sh "${args[@]}"
+
+      - name: Write summary
+        if: always()
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          {
+            echo "## Semgrep"
+            if [ -n "$BASE_SHA" ]; then
+              echo "Only findings introduced by this PR."
+            else
+              echo "Full scan of the repository."
+            fi
+            echo '```'
+            if [ ! -f src/semgrep.json ]; then
+              echo "Scan not completed."
+            elif [ -s src/semgrep.txt ]; then
+              cat src/semgrep.txt
+            else
+              echo "No findings."
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: semgrep
+          path: src/semgrep.json
+          if-no-files-found: ignore
+
+  trivy:
+    name: Trivy (libraries and base image)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare Python requirements
+        run: |
+          # Where requirements.txt is generated from requirements.base.txt (it is not in git),
+          # scan the base file under the name Trivy recognises.
+          find . -name requirements.base.txt -not -path './.git/*' | while read -r base; do
+            dir=$(dirname "$base")
+            if [ ! -f "$dir/requirements.txt" ]; then
+              cp "$base" "$dir/requirements.txt"
+              echo "Scanning $base as $dir/requirements.txt"
+            fi
+          done
+
+      - name: Scan libraries
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" fs \
+            --scanners vuln --skip-dirs '**/target' --skip-dirs '**/node_modules' --exit-code 0 \
+            --format table --output trivy-libraries.txt .
+
+      - name: Find base image
+        env:
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          TARGET_STAGE: ${{ inputs.target-stage }}
+        run: |
+          if [ ! -f "$DOCKERFILE" ]; then
+            echo "::warning::Dockerfile '$DOCKERFILE' not found: base image not scanned"
+            exit 0
+          fi
+          # one line per stage: "<image> <alias>" (flags like --platform are skipped)
+          awk 'toupper($1) == "FROM" {
+                 img = ""; alias = ""
+                 for (i = 2; i <= NF; i++) {
+                   if ($i ~ /^--/) continue
+                   if (img == "") { img = $i; continue }
+                   if (toupper($i) == "AS") { alias = $(i + 1); break }
+                 }
+                 print img, alias
+               }' "$DOCKERFILE" > stages.txt
+          image=$(awk -v t="$TARGET_STAGE" 'tolower($2) == tolower(t) { print $1 }' stages.txt | tail -1)
+          [ -n "$image" ] || image=$(tail -1 stages.txt | awk '{ print $1 }')
+          # a stage built FROM another stage: follow the chain to the real image
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            parent=$(awk -v t="$image" 'tolower($2) == tolower(t) { print $1 }' stages.txt | tail -1)
+            [ -n "$parent" ] || break
+            image=$parent
+          done
+          if [[ "$image" == *'$'* || "$image" == scratch ]]; then
+            echo "::warning::Base image '$image' cannot be resolved statically: not scanned"
+            exit 0
+          fi
+          echo "BASE_IMAGE=$image" >> "$GITHUB_ENV"
+
+      - name: Scan base image
+        if: env.BASE_IMAGE != ''
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src "$TRIVY_IMAGE" image \
+            --scanners vuln --exit-code 0 \
+            --format table --output trivy-image.txt "$BASE_IMAGE"
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## Trivy: libraries"
+            echo '```'
+            cat trivy-libraries.txt 2>/dev/null || echo "Scan not completed."
+            echo '```'
+            echo "## Trivy: base image \`${BASE_IMAGE:-not found}\`"
+            echo '```'
+            cat trivy-image.txt 2>/dev/null || echo "Scan not completed."
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  gitleaks:
+    name: gitleaks (secrets)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "$BASE_SHA" ]; then
+            # PR: only the commits of the PR
+            mode=(git /src --log-opts="$BASE_SHA..$HEAD_SHA")
+          else
+            # scheduled or manual: the current tree
+            mode=(dir /src)
+          fi
+          docker run --rm -v "$PWD:/src" "$GITLEAKS_IMAGE" "${mode[@]}" \
+            --redact --exit-code 0 --no-banner \
+            --report-format json --report-path /src/gitleaks.json
+
+      - name: Write summary
+        if: always()
+        run: |
+          {
+            echo "## gitleaks"
+            echo "Secret values are redacted."
+            echo '```'
+            if [ ! -f gitleaks.json ]; then
+              echo "Scan not completed."
+            elif [ "$(jq length gitleaks.json)" -gt 0 ]; then
+              jq -r '.[] | "\(.RuleID)  \(.File):\(.StartLine)  commit \(.Commit[0:8])"' gitleaks.json
+            else
+              echo "No findings."
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
