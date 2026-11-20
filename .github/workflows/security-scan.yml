@@ -157,8 +157,10 @@ jobs:
             echo "::warning::Dockerfile '$DOCKERFILE' not found: base image not scanned"
             exit 0
           fi
-          # one line per stage: "<image> <alias>" (flags like --platform are skipped)
-          awk 'toupper($1) == "FROM" {
+          # one line per stage: "<image> <alias>" (flags like --platform are skipped;
+          # CRLF line endings are stripped, or "dist\r" would not match the stage name)
+          awk '{ sub(/\r$/, "") }
+               toupper($1) == "FROM" {
                  img = ""; alias = ""
                  for (i = 2; i <= NF; i++) {
                    if ($i ~ /^--/) continue
